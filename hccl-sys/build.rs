@@ -65,6 +65,9 @@ fn main() {
         .allowlist_function("HcclGetCommAsyncError")
         .allowlist_function("HcclCommSuspend")
         .allowlist_function("HcclCommResume")
+        // ACL functions
+        .allowlist_function("aclrtSetDevice")
+        .allowlist_function("aclrtStreamSynchronize")
         // Collective communication
         .allowlist_function("HcclAllReduce")
         .allowlist_function("HcclBroadcast")

@@ -111,9 +111,75 @@ HcclAPI* HcclAPI::get() {
 
 } // namespace hccl_sys
 
+namespace acl_sys {
+
+struct AclAPI {
+    aclError (*aclrtSetDevice_)(int32_t);
+    aclError (*aclrtStreamSynchronize_)(aclrtStream);
+
+    int init_result_;
+
+    static AclAPI* get();
+};
+
+namespace {
+
+AclAPI create_acl_api() {
+    AclAPI r{};
+    r.init_result_ = 0; // ACL_SUCCESS
+
+    // Try libascendcl.so or libacl.so depending on version, usually libascendcl.so
+    void* handle = dlopen("libascendcl.so", RTLD_LAZY | RTLD_NOLOAD);
+    if (!handle) {
+        handle = dlopen("libascendcl.so", RTLD_LAZY);
+    }
+    
+    // Fallback or additional paths if needed
+    if (!handle) {
+         handle = dlopen("/usr/local/Ascend/ascend-toolkit/latest/lib64/libascendcl.so", RTLD_LAZY);
+    }
+
+    if (!handle) {
+        std::cerr << "[HCCL-SYS] Warning: Can't open libascendcl.so: " << dlerror() << std::endl;
+        r.init_result_ = -1; 
+        return r;
+    }
+
+#define LOOKUP_ACL_ENTRY(name) \
+    r.name##_ = reinterpret_cast<decltype(r.name##_)>(dlsym(handle, #name)); \
+    if (!r.name##_) { \
+        std::cerr << "[HCCL-SYS] Warning: Can't find " << #name << ": " << dlerror() << std::endl; \
+        r.init_result_ = -1; \
+        return r; \
+    }
+
+    LOOKUP_ACL_ENTRY(aclrtSetDevice)
+    LOOKUP_ACL_ENTRY(aclrtStreamSynchronize)
+
+#undef LOOKUP_ACL_ENTRY
+
+    return r;
+}
+
+} // namespace
+
+AclAPI* AclAPI::get() {
+    static AclAPI singleton = create_acl_api();
+    return &singleton;
+}
+
+} // namespace acl_sys
+
+
 #define GET_HCCL_API(api_ptr) \
     hccl_sys::HcclAPI* api_ptr = hccl_sys::HcclAPI::get(); \
     if (api_ptr->init_result_ != HCCL_SUCCESS) { \
+        return api_ptr->init_result_; \
+    }
+
+#define GET_ACL_API(api_ptr) \
+    acl_sys::AclAPI* api_ptr = acl_sys::AclAPI::get(); \
+    if (api_ptr->init_result_ != 0) { \
         return api_ptr->init_result_; \
     }
 
@@ -226,6 +292,16 @@ const char *HcclGetErrorString(HcclResult code) {
         return "HCCL library not initialized";
     }
     return api->HcclGetErrorString_(code);
+}
+
+aclError aclrtSetDevice(int32_t deviceId) {
+    GET_ACL_API(api);
+    return api->aclrtSetDevice_(deviceId);
+}
+
+aclError aclrtStreamSynchronize(aclrtStream stream) {
+    GET_ACL_API(api);
+    return api->aclrtStreamSynchronize_(stream);
 }
 
 } // extern "C"

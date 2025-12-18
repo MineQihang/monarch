@@ -29,6 +29,10 @@ extern "C" {
 // We can add any extra helper functions or types here if needed
 // For now, we rely on hccl.h and hccl_types.h
 
+// Helper ACL functions bound via dlopen
+aclError aclrtSetDevice(int32_t deviceId);
+aclError aclrtStreamSynchronize(aclrtStream stream);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif
