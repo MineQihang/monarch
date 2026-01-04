@@ -15,6 +15,7 @@ members = [
     "monarch_conda",
     "monarch_cpp_static_libs",
     "monarch_extension",
+    "monarch_hixl",
     "monarch_hyperactor",
     "monarch_messages",
     "monarch_perfetto_trace",

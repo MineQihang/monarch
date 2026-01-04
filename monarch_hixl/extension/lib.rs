@@ -1,0 +1,279 @@
+#![allow(unsafe_op_in_unsafe_fn)]
+use std::ops::Deref;
+
+use hyperactor::ActorId;
+use hyperactor::ActorRef;
+use hyperactor::Named;
+use hyperactor::ProcId;
+use hyperactor_mesh::RootActorMesh;
+use hyperactor_mesh::shared_cell::SharedCell;
+use monarch_hyperactor::context::PyInstance;
+use monarch_hyperactor::proc_mesh::PyProcMesh;
+use monarch_hyperactor::pytokio::PyPythonTask;
+use monarch_hyperactor::runtime::signal_safe_block_on;
+use monarch_hyperactor::v1::proc_mesh::PyProcMesh as PyProcMeshV1;
+
+// Use monarch_hixl types
+use monarch_hixl::RdmaBuffer;
+use monarch_hixl::RdmaManagerActor;
+use monarch_hixl::RdmaManagerMessageClient;
+use monarch_hixl::rdma_supported;
+
+use pyo3::IntoPyObjectExt;
+use pyo3::exceptions::PyException;
+use pyo3::exceptions::PyValueError;
+use pyo3::prelude::*;
+use pyo3::types::PyAny;
+use pyo3::types::PyTuple;
+use pyo3::types::PyType;
+use serde::Deserialize;
+use serde::Serialize;
+
+
+fn setup_rdma_context(
+    rdma_buffer: &PyRdmaBuffer,
+    local_proc_id: String,
+) -> (ActorRef<RdmaManagerActor>, RdmaBuffer) {
+    let proc_id: ProcId = local_proc_id.parse().unwrap();
+    let local_owner_id = ActorId(proc_id, "rdma_manager".to_string(), 0);
+    let local_owner_ref: ActorRef<RdmaManagerActor> = ActorRef::attest(local_owner_id);
+    let buffer = rdma_buffer.buffer.clone();
+    (local_owner_ref, buffer)
+}
+
+#[pyclass(name = "_RdmaBuffer", module = "monarch._rust_bindings.rdma")]
+#[derive(Clone, Serialize, Deserialize, Named)]
+struct PyRdmaBuffer {
+    buffer: RdmaBuffer,
+    owner_ref: ActorRef<RdmaManagerActor>,
+}
+
+async fn create_rdma_buffer(
+    addr: usize,
+    size: usize,
+    proc_id: ProcId,
+    client: PyInstance,
+) -> PyResult<PyRdmaBuffer> {
+    let owner_id = ActorId(proc_id, "rdma_manager".to_string(), 0);
+    let owner_ref: ActorRef<RdmaManagerActor> = ActorRef::attest(owner_id);
+
+    // Using request_buffer (assuming hyperactor generates this)
+    let buffer = owner_ref
+        .request_buffer(client.deref(), addr, size)
+        .await?;
+    Ok(PyRdmaBuffer { buffer, owner_ref })
+}
+
+#[pymethods]
+impl PyRdmaBuffer {
+    #[classmethod]
+    fn create_rdma_buffer_nonblocking<'py>(
+        _cls: &Bound<'_, PyType>,
+        _py: Python<'py>,
+        addr: usize,
+        size: usize,
+        proc_id: String,
+        client: PyInstance,
+    ) -> PyResult<PyPythonTask> {
+        if !rdma_supported() {
+            return Err(PyException::new_err("RDMA is not supported on this system"));
+        }
+        PyPythonTask::new(create_rdma_buffer(
+            addr,
+            size,
+            proc_id.parse().unwrap(),
+            client,
+        ))
+    }
+
+    #[classmethod]
+    fn create_rdma_buffer_blocking<'py>(
+        _cls: &Bound<'_, PyType>,
+        py: Python<'py>,
+        addr: usize,
+        size: usize,
+        proc_id: String,
+        client: PyInstance,
+    ) -> PyResult<PyRdmaBuffer> {
+        if !rdma_supported() {
+            return Err(PyException::new_err("RDMA is not supported on this system"));
+        }
+        signal_safe_block_on(
+            py,
+            create_rdma_buffer(addr, size, proc_id.parse().unwrap(), client),
+        )?
+    }
+
+    #[classmethod]
+    fn rdma_supported<'py>(_cls: &Bound<'_, PyType>, _py: Python<'py>) -> bool {
+        rdma_supported()
+    }
+
+    #[pyo3(name = "__repr__")]
+    fn repr(&self) -> String {
+        format!("<RdmaBuffer'{:?}'>", self.buffer)
+    }
+
+    #[pyo3(signature = (addr, size, local_proc_id, client, timeout))]
+    fn read_into<'py>(
+        &self,
+        _py: Python<'py>,
+        addr: usize,
+        size: usize,
+        local_proc_id: String,
+        client: PyInstance,
+        timeout: u64,
+    ) -> PyResult<PyPythonTask> {
+        let (local_owner_ref, buffer) = setup_rdma_context(self, local_proc_id);
+        PyPythonTask::new(async move {
+            let local_buffer = local_owner_ref
+                .request_buffer(client.deref(), addr, size)
+                .await?;
+            local_buffer
+                .write_from(client.deref(), buffer, timeout)
+                .await
+                .map_err(|e| PyException::new_err(format!("failed to read into buffer: {}", e)))?;
+            local_owner_ref
+                .release_buffer(client.deref(), local_buffer)
+                .await?;
+            Ok(())
+        })
+    }
+
+    #[pyo3(signature = (addr, size, local_proc_id, client, timeout))]
+    fn write_from<'py>(
+        &self,
+        _py: Python<'py>,
+        addr: usize,
+        size: usize,
+        local_proc_id: String,
+        client: PyInstance,
+        timeout: u64,
+    ) -> PyResult<PyPythonTask> {
+        let (local_owner_ref, buffer) = setup_rdma_context(self, local_proc_id);
+        PyPythonTask::new(async move {
+            let local_buffer = local_owner_ref
+                .request_buffer(client.deref(), addr, size)
+                .await?;
+            local_buffer
+                .read_into(client.deref(), buffer, timeout)
+                .await
+                .map_err(|e| PyException::new_err(format!("failed to write from buffer: {}", e)))?;
+            local_owner_ref
+                .release_buffer(client.deref(), local_buffer)
+                .await?;
+            Ok(())
+        })
+    }
+
+    fn size(&self) -> usize {
+        self.buffer.size
+    }
+
+    fn __reduce__(&self) -> PyResult<(PyObject, PyObject)> {
+        Python::with_gil(|py| {
+            let ctor = py.get_type::<PyRdmaBuffer>().into_py_any(py)?;
+            let json = serde_json::to_string(self).map_err(|e| {
+                PyErr::new::<PyValueError, _>(format!("Serialization failed: {}", e))
+            })?;
+
+            let args = PyTuple::new(py, [json])?.into_py_any(py)?;
+            Ok((ctor, args))
+        })
+    }
+
+    #[new]
+    fn new_from_json(json: &str) -> PyResult<Self> {
+        let deserialized: PyRdmaBuffer = serde_json::from_str(json)
+            .map_err(|e| PyErr::new::<PyValueError, _>(format!("Deserialization failed: {}", e)))?;
+        Ok(deserialized)
+    }
+
+    fn drop<'py>(
+        &self,
+        _py: Python<'py>,
+        local_proc_id: String,
+        client: PyInstance,
+    ) -> PyResult<PyPythonTask> {
+        let (_local_owner_ref, buffer) = setup_rdma_context(self, local_proc_id);
+        PyPythonTask::new(async move {
+            buffer
+                .drop_buffer(client.deref())
+                .await
+                .map_err(|e| PyException::new_err(format!("Failed to drop buffer: {}", e)))?;
+            Ok(())
+        })
+    }
+
+    fn owner_actor_id(&self) -> String {
+        self.owner_ref.actor_id().to_string()
+    }
+}
+
+#[pyclass(name = "_RdmaManager", module = "monarch._rust_bindings.rdma")]
+pub struct PyRdmaManager {
+    #[allow(dead_code)]
+    inner: SharedCell<RootActorMesh<'static, RdmaManagerActor>>,
+    device: String,
+}
+
+#[pymethods]
+impl PyRdmaManager {
+    #[pyo3(name = "__repr__")]
+    fn repr(&self) -> String {
+        format!("<RdmaManager(device='{}')>", self.device)
+    }
+
+    #[getter]
+    fn device(&self) -> &str {
+        &self.device
+    }
+
+    #[classmethod]
+    fn create_rdma_manager_nonblocking(
+        _cls: &Bound<'_, PyType>,
+        proc_mesh: &Bound<'_, PyAny>,
+        client: PyInstance,
+    ) -> PyResult<PyPythonTask> {
+        tracing::debug!("spawning RDMA manager on target proc_mesh nodes");
+
+        if let Ok(v0) = proc_mesh.downcast::<PyProcMesh>() {
+            let tracked_proc_mesh = v0.borrow().try_inner()?;
+            PyPythonTask::new(async move {
+                let actor_mesh: SharedCell<RootActorMesh<RdmaManagerActor>> = tracked_proc_mesh
+                    .spawn(client.deref(), "rdma_manager", &None)
+                    .await
+                    .map_err(|err| PyException::new_err(err.to_string()))?;
+
+                Ok(Some(PyRdmaManager {
+                    inner: actor_mesh,
+                    device: "remote_rdma_device".to_string(),
+                }))
+            })
+        } else {
+            let proc_mesh = proc_mesh.downcast::<PyProcMeshV1>()?.borrow().mesh_ref()?;
+            PyPythonTask::new(async move {
+                let actor_mesh: hyperactor_mesh::v1::ActorMesh<RdmaManagerActor> = proc_mesh
+                    .spawn_service(client.deref(), "rdma_manager", &None)
+                    .await
+                    .map_err(|err| PyException::new_err(err.to_string()))?;
+
+                let actor_mesh = RootActorMesh::from(actor_mesh);
+                let actor_mesh = SharedCell::from(actor_mesh);
+
+                Ok(Some(PyRdmaManager {
+                    inner: actor_mesh,
+                    device: "remote_rdma_device".to_string(),
+                }))
+            })
+        }
+    }
+}
+
+pub fn register_python_bindings(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    // Note: PyTorch segment scanner not supported for Hixl backend currently
+    
+    module.add_class::<PyRdmaBuffer>()?;
+    module.add_class::<PyRdmaManager>()?;
+    Ok(())
+}
